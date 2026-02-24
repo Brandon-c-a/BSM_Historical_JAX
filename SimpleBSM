@@ -1,85 +1,75 @@
-# Setup : Periodicity
-Days_T = 252.0
-Hours_T = 252.0 * 6.5
-Minutes_T = 252.0 * 6.5 * 60.0
+import jax
+import jax.numpy as jnp
+from jax import jit, vmap
+from jax.scipy.special import ndtr
 
-Days_C = 365.0
-Hours_C = 365.0 * 24.0
-Minutes_C = 365.0 * 24.0 * 60.0
-
-Days = jnp.array([Days_T, Days_C]) 
-Hours = jnp.array([Hours_T, Hours_C]) 
-Minutes = jnp.array([Minutes_T, Minutes_C]) 
-
-# Define Dual Clock Time-Scale
-Time_Expiration = 5
-T = Time_Expiration / Hours
-T_t = T[0]
-T_c = T[1]
-np.set_printoptions(precision=4, suppress=False, floatmode='fixed')
-print(T_t, T_c)
-
-# Define Returns & Volatility
-@jax.jit
-def process_market_data(hourly_prices, rates, pT, pC):
-   
-    y_ln = jnp.log(hourly_prices.astype(jnp.float64))
-    risk_free_period = rates[:-1] / pC
+@jax.jit 
+def BSM_Dual_Clock(S, K, r, q, vol, T_T, T_C):
+    SK = jnp.log(S/K)
     
-    # 1. Log Returns
-    log_returns = jnp.diff(y_ln)
-    Excess_returns = log_returns - risk_free_period
-    
-    # 3. Volatility 
-    time_scale = jnp.sqrt(pT)
-    
-    vol_annual = jnp.std(log_returns) * time_scale
-    Ex_vol_annual = jnp.std(Excess_returns) * time_scale
-    
-    return log_returns.size, log_returns, Excess_returns, vol_annual, Ex_vol_annual
-
-N_points, returns, Ex_returns, vol_ann, Ex_vol_ann = process_market_data(S_arr, r_arr, Hours_T, Hours_C)
-
-print(f"\nLast Price: ${S0:.2f} | Volatility: {vol_ann:.2%}, {Ex_vol_ann:.2%}  | Div Yield: {q0:.2%}")
-
-# Define BSM paramaters
-@jax.jit
-def bsm_historical_hyper_fast(S, K, T_t,T_c, r, q, vol):
-    
-    v_sqT = vol * jnp.sqrt(jnp.maximum(T_t, 1e-7))
+    # Volatility uses Trading Time
+    Vol_Term = vol * jnp.sqrt(jnp.maximum(T_T, 1e-7)) 
     
     # Drift uses Calendar Time
-    r_drift = r * T_c
-    q_drift = q * T_c
-    
-    disc_S = jnp.exp(-q_drift)
-    disc_K = jnp.exp(-r_drift)
-    
-    S_adj = S * disc_S
-    K_adj = K * disc_K
+    rT = r * T_C
+    qT = q * T_C
 
-    drift_term = r_drift - q_drift
-    vol_term   = 0.5 * (v_sqT**2)
-    
-    d1 = (jnp.log(S / K) + drift_term + vol_term) / v_sqT
-    d2 = d1 - v_sqT
+    d1 = (SK + rT - qT)/Vol_Term + Vol_Term/2
+    d2 = d1 - Vol_Term
+
+    Se = S * jnp.exp(-qT)
+    Ke = K * jnp.exp(-rT)
 
     Nd1 = ndtr(d1)
     Nd2 = ndtr(d2)
+    
+    P_Call = Se * Nd1 - Ke * Nd2
+    P_Put = P_Call + Ke - Se # Put-Call Parity
 
-    Call_p = (S_adj * Nd1) - (K_adj * Nd2)
-    Put_p = Call_p - S_adj + K_adj 
+    return P_Call, P_Put
 
-    return Call_p, Put_p
+# Level 1: Vectorize Time (T) -> Result Shape: (L,)
+# We map over args 5 (T_T) and 6 (T_C).
+vmap_T = vmap(BSM_Dual_Clock, in_axes=(None, None, None, None, None, 0, 0))
 
-fBSM = jit(vmap(bsm_historical_hyper_fast, in_axes=(0, None, None, None, 0, None, None)))
+# Level 2: Vectorize Strikes (K) -> Result Shape: (M, L)
+# We map over arg 1 (K).
+# Note: T_T and T_C are now Arrays, so we pass None to broadcast the whole array to vmap_T
+vmap_K = vmap(vmap_T, in_axes=(None, 0, None, None, None, None, None))
 
-Call_arr, Put_arr = fBSM(S_arr, Xs, T_t, T_c, r_arr, q0, Ex_vol_ann)
+# Level 3: Vectorize History (N) -> Result Shape: (N, M, L)
+# We map over S(0), r(2), q(3), vol(4).
+# K, T_T, T_C are broadcast as full arrays to the inner layers.
+fBSM_Chain = jit(vmap(vmap_K, in_axes=(0, None, 0, 0, 0, None, None)))
 
-print(f"\n--- BSM OUTPUT (Last 3 Rows, N={N_points}) ---")
-np.set_printoptions(precision=2, suppress=False, floatmode='fixed')
 
-print(f"Call Prices: {Call_arr[-3:]}")
-print(f"Put Prices:  {Put_arr[-3:]}")
-print("-" * 60)
-print(f"Moneyness (S-K): {S_arr[-3:] - Xs}")
+# --- 3. DUMMY DATA FOR TESTING ---
+# Creating dummy data to prove it runs
+N = 100 # History
+M = 5   # Strikes
+L = 3   # Expirations
+
+S_arr = jnp.ones(N) * 100.0
+r_arr = jnp.ones(N) * 0.05
+q_Trailing = jnp.zeros(N)
+vol_Trailing = jnp.ones(N) * 0.20
+
+Ks = jnp.array([90.0, 95.0, 100.0, 105.0, 110.0]) # Shape (M,)
+
+Ts_Trading = jnp.array([5/252, 10/252, 30/252])   # Shape (L,)
+Ts_Calendar = jnp.array([5/365, 10/365, 30/365])  # Shape (L,)
+
+
+# --- 4. EXECUTION ---
+Calls_3D, Puts_3D = fBSM_Chain(
+    S_arr,          
+    Ks,             
+    r_arr,          
+    q_Trailing,     
+    vol_Trailing,   
+    Ts_Trading,     
+    Ts_Calendar     
+)
+
+print(f"Output Shape: {Calls_3D.shape}") 
+# Expected: (100, 5, 3)
