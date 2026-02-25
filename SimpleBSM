@@ -1,7 +1,4 @@
-import jax
-import jax.numpy as jnp
-from jax import jit, vmap
-from jax.scipy.special import ndtr
+# Tagging the function with "#@jax.jit" limits non-JAX use-cases :: for versatility, you can simply run "jit(BSM_Dual_Clock)"  
 
 @jax.jit 
 def BSM_Dual_Clock(S, K, r, q, vol, T_T, T_C):
@@ -28,39 +25,24 @@ def BSM_Dual_Clock(S, K, r, q, vol, T_T, T_C):
 
     return P_Call, P_Put
 
-# Level 1: Vectorize Time (T) -> Result Shape: (L,)
-# We map over args 5 (T_T) and 6 (T_C).
+# Vectorize Time (T) -> Result Shape: (L,)
+# Map over args 5 (T_T) and 6 (T_C).
+
 vmap_T = vmap(BSM_Dual_Clock, in_axes=(None, None, None, None, None, 0, 0))
 
 # Level 2: Vectorize Strikes (K) -> Result Shape: (M, L)
 # We map over arg 1 (K).
-# Note: T_T and T_C are now Arrays, so we pass None to broadcast the whole array to vmap_T
+# Note: T_T and T_C are now Arrays; pass 'None' to broadcast the whole array to vmap_T
+
 vmap_K = vmap(vmap_T, in_axes=(None, 0, None, None, None, None, None))
 
 # Level 3: Vectorize History (N) -> Result Shape: (N, M, L)
-# We map over S(0), r(2), q(3), vol(4).
-# K, T_T, T_C are broadcast as full arrays to the inner layers.
+# Map over S(0), r(2), q(3), vol(4).
+# [ K, T_T, T_C ] broadcasted as full arrays to the inner layers.
+
 fBSM_Chain = jit(vmap(vmap_K, in_axes=(0, None, 0, 0, 0, None, None)))
 
-
-# --- 3. DUMMY DATA FOR TESTING ---
-# Creating dummy data to prove it runs
-N = 100 # History
-M = 5   # Strikes
-L = 3   # Expirations
-
-S_arr = jnp.ones(N) * 100.0
-r_arr = jnp.ones(N) * 0.05
-q_Trailing = jnp.zeros(N)
-vol_Trailing = jnp.ones(N) * 0.20
-
-Ks = jnp.array([90.0, 95.0, 100.0, 105.0, 110.0]) # Shape (M,)
-
-Ts_Trading = jnp.array([5/252, 10/252, 30/252])   # Shape (L,)
-Ts_Calendar = jnp.array([5/365, 10/365, 30/365])  # Shape (L,)
-
-
-# --- 4. EXECUTION ---
+# --- 3. EXECUTION ---
 Calls_3D, Puts_3D = fBSM_Chain(
     S_arr,          
     Ks,             
@@ -72,4 +54,3 @@ Calls_3D, Puts_3D = fBSM_Chain(
 )
 
 print(f"Output Shape: {Calls_3D.shape}") 
-# Expected: (100, 5, 3)
