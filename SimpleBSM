@@ -1,56 +1,112 @@
-# Tagging the function with "#@jax.jit" limits non-JAX use-cases :: for versatility, you can simply run "jit(BSM_Dual_Clock)"  
+import jax
+import jax.numpy as jnp
+from jax import vmap
+from jax.scipy.special import ndtr
 
-@jax.jit 
-def BSM_Dual_Clock(S, K, r, q, vol, T_T, T_C):
-    SK = jnp.log(S/K)
+# 1. THE SLICE MATH (Takes pre-calculated logs and expired arrays)
+def compute_2D_slice_full(S_b, K_b, r_b, q_b, vol_b, log_S_b, log_K_b, P_Call_exp, P_Put_exp, T_T_scalar, T_C_scalar):
     
-    # Volatility uses Trading Time
-    Vol_Term = vol * jnp.sqrt(jnp.maximum(T_T, 1e-7)) 
+    SK = log_S_b - log_K_b
+    T_T_safe = jnp.maximum(T_T_scalar, jnp.finfo(float).eps)
+    Vol_Term = vol_b * jnp.sqrt(T_T_safe)
     
-    # Drift uses Calendar Time
-    rT = r * T_C
-    qT = q * T_C
+    rT = r_b * T_C_scalar
+    qT = q_b * T_C_scalar
 
-    d1 = (SK + rT - qT)/Vol_Term + Vol_Term/2
+    d1 = (SK + rT - qT) / Vol_Term + Vol_Term / 2.0
     d2 = d1 - Vol_Term
 
-    Se = S * jnp.exp(-qT)
-    Ke = K * jnp.exp(-rT)
+    # Se and Ke calculated once per slice, sitting in fast L1 Cache
+    Se = S_b * jnp.exp(-qT)
+    Ke = K_b * jnp.exp(-rT)
 
-    Nd1 = ndtr(d1)
-    Nd2 = ndtr(d2)
-    
-    P_Call = Se * Nd1 - Ke * Nd2
-    P_Put = P_Call + Ke - Se # Put-Call Parity
+    # Active Options (Using Parity for the Put to save FLOPs)
+    P_Call_active = Se * ndtr(d1) - Ke * ndtr(d2)
+    P_Put_active  = P_Call_active + Ke - Se 
+
+    # Route safely for T=0
+    is_active = T_T_scalar > 0.0
+    P_Call = jnp.where(is_active, P_Call_active, P_Call_exp)
+    P_Put  = jnp.where(is_active, P_Put_active, P_Put_exp)
 
     return P_Call, P_Put
 
-# Vectorize Time (T) -> Result Shape: (L,)
-# Map over args 5 (T_T) and 6 (T_C).
+# 2. THE ROUTER (Does 1D/2D math exactly ONCE, then vmaps the Time slices)
+def fBSM_Chain_Full(S, K, r, q, vol, T_T, T_C):
+    
+    # -------------------------------------------------------------
+    # HOISTED MATH: Done once, outside the loop!
+    # -------------------------------------------------------------
+    log_S = jnp.log(S)
+    log_K = jnp.log(K)
+    
+    S_minus_K = S[:, None] - K[None, :]
+    P_Call_expired = jnp.maximum(S_minus_K, 0.0)
+    P_Put_expired = jnp.maximum(-S_minus_K, 0.0)
 
-vmap_T = vmap(BSM_Dual_Clock, in_axes=(None, None, None, None, None, 0, 0))
+    # -------------------------------------------------------------
+    # BROADCAST TO 2D
+    # -------------------------------------------------------------
+    S_b = S[:, None]
+    K_b = K[None, :]
+    log_S_b = log_S[:, None]
+    log_K_b = log_K[None, :]
+    r_b = r[:, None]
+    q_b = q[:, None]
+    vol_b = vol[:, None]
 
-# Level 2: Vectorize Strikes (K) -> Result Shape: (M, L)
-# We map over arg 1 (K).
-# Note: T_T and T_C are now Arrays; pass 'None' to broadcast the whole array to vmap_T
+    # -------------------------------------------------------------
+    # THE VMAP LOOP
+    # -------------------------------------------------------------
+    # Map over the 2 Time arrays (axis=0). Everything else stays constant (None)
+    mapper = vmap(compute_2D_slice_full, in_axes=(
+        None, None, None, None, None, None, None, None, None, 0, 0
+    ))
+    
+    P_Call, P_Put = mapper(
+        S_b, K_b, r_b, q_b, vol_b, log_S_b, log_K_b, P_Call_expired, P_Put_expired, T_T, T_C
+    )
+    
+    return jnp.transpose(P_Call, (1, 2, 0)), jnp.transpose(P_Put, (1, 2, 0))
 
-vmap_K = vmap(vmap_T, in_axes=(None, 0, None, None, None, None, None))
+fBSM_Chain_jit = jax.jit(fBSM_Chain_Full)
 
-# Level 3: Vectorize History (N) -> Result Shape: (N, M, L)
-# Map over S(0), r(2), q(3), vol(4).
-# [ K, T_T, T_C ] broadcasted as full arrays to the inner layers.
+print("Warming up GPU and compiling XLA graph...")
+# 1. Run the warm up using standard variables
+P_Call, P_Put = fBSM_Chain_jit(S_arr, Ks, r_arr, q_Trailing, vol_Trailing, Ts_Trading, Ts_Calendar)
+P_Call.block_until_ready()
 
-fBSM_Chain = jit(vmap(vmap_K, in_axes=(0, None, 0, 0, 0, None, None)))
+# 2. MANUALLY DESTROY THE WARM-UP ARRAYS
+# This instantly frees the 4.29 GB back to the GPU
+P_Call.delete()
+P_Put.delete()
+print("Warm-up complete! Memory cleared.")
 
-# --- 3. EXECUTION ---
-Calls_3D, Puts_3D = fBSM_Chain(
-    S_arr,          
-    Ks,             
-    r_arr,          
-    q_Trailing,     
-    vol_Trailing,   
-    Ts_Trading,     
-    Ts_Calendar     
-)
+iterations = 10
+print(f"Clocking {iterations} consecutive runs...")
 
-print(f"Output Shape: {Calls_3D.shape}") 
+start_time = time.perf_counter()
+
+for _ in range(iterations):
+    # 3. Calculate the arrays
+    P_Call, P_Put = fBSM_Chain_jit(S_arr, Ks, r_arr, q_Trailing, vol_Trailing, Ts_Trading, Ts_Calendar)
+    
+    # 4. Wait for them to physically finish computing
+    P_Call.block_until_ready() 
+    
+    # 5. IMMEDIATELY DELETE THEM to make room for the next loop iteration
+    P_Call.delete()
+    P_Put.delete()
+
+end_time = time.perf_counter()
+
+# Calculate the metrics
+total_time = end_time - start_time
+avg_time_ms = (total_time / iterations) * 1000  # Convert seconds to milliseconds
+grid_size = len(S_arr) * len(Ks) * len(Ts_Trading)
+
+print("-" * 40)
+print(f"Average Time per run: {avg_time_ms:.2f} ms")
+print(f"Total Grid Size:      {grid_size:,} option prices")
+print(f"GPU Throughput:       {(grid_size / (avg_time_ms / 1000)) / 1e6:.2f} Million prices / second")
+print("-" * 40)
