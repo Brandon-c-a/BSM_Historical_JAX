@@ -1,0 +1,29 @@
+import jax
+import jax.numpy as jnp
+from jax import random
+
+# Define pipeline dimensions
+N, M, L = 393950, 40, 20
+
+# The Explicit State Architecture :: Initialize a master PRNG key. 
+master_key = random.PRNGKey(42)
+
+# Split the key into 7 independent subkeys
+keys = random.split(master_key, 7)
+key_S, key_r, key_q, key_vol, key_K, key_TT, key_TC = keys
+
+# Historical Arrays (Shape: N)
+S_arr = random.uniform(key_S, shape=(N,), minval=50.0, maxval=150.0)
+r_arr = random.uniform(key_r, shape=(N,), minval=0.01, maxval=0.05)
+q_Trailing = random.uniform(key_q, shape=(N,), minval=0.0, maxval=0.03)
+vol_Trailing = random.uniform(key_vol, shape=(N,), minval=0.10, maxval=0.80)
+
+# Strike Surface (Shape: M) :: Sort to mimic  physical layout of an option chain :: Improves memory access patterns.
+Ks = jnp.sort(random.uniform(key_K, shape=(M,), minval=50.0, maxval=150.0))
+
+# Expiration Timelines (Shape: L) :: Generate Trading Time between roughly 1 day (1/252) and 2 years (2.0)
+weekend_drift = random.uniform(key_TC, shape=(L,), minval=0.0, maxval=0.05)
+Ts_Trading = jnp.sort(random.uniform(key_TT, shape=(L,), minval=1/252, maxval=2.0))
+Ts_Calendar = Ts_Trading + weekend_drift
+
+print((f"S_arr Shape: {S_arr.shape}"),(f"Ks Shape: {Ks.shape}"),(f"Ts_Trading Shape: {Ts_Trading.shape}"))
